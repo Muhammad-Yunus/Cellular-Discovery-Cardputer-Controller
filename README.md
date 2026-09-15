@@ -16,39 +16,39 @@ Built for **M5Cardputer** running **UIFlow 2 / MicroPython**.
 ## Application Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│  M5Cardputer (UIFlow 2 / MicroPython)                    │
+┌───────────────────────────────────────────────────────────┐
+│  M5Cardputer (UIFlow 2 / MicroPython)                     │
 │                                                           │
 │  ┌───────────────────────────────────────────────────┐    │
 │  │  LIST View (default)                              │    │
 │  │                                                   │    │
-│  │  1. WiFi connect (saved / hard-coded SSID)       │    │
+│  │  1. WiFi connect (saved / hard-coded SSID)        │    │
 │  │  2. Derive host range from ifconfig()             │    │
-│  │  3. Sweep: one host per loop pass                │    │
-│  │     ├── TCP probe on :8001 (250 ms budget)       │    │
-│  │     └── HTTP GET /health (3 s budget)            │    │
-│  │  4. Render 6-row results list + progress bar     │    │
-│  │  5. Keyboard: UP/DOWN select, ENTER → DETAIL     │    │
-│  │  6. BtnA: stop scan / rescan                     │    │
+│  │  3. Sweep: one host per loop pass                 │    │
+│  │     ├── TCP probe on :8001 (250 ms budget)        │    │
+│  │     └── HTTP GET /health (3 s budget)             │    │
+│  │  4. Render 6-row results list + progress bar      │    │
+│  │  5. Keyboard: UP/DOWN select, ENTER → DETAIL      │    │
+│  │  6. BtnA: stop scan / rescan                      │    │
 │  └───────────────────────────────────────────────────┘    │
 │                          │ ENTER                          │
-│                          ▼                                 │
+│                          ▼                                │
 │  ┌───────────────────────────────────────────────────┐    │
 │  │  DETAIL View                                      │    │
 │  │                                                   │    │
-│  │  1. GET http://<ip>:8001/api/v1/device/status    │    │
-│  │     (accept: application/json, 3 s budget)       │    │
-│  │  2. Parse JSON → grouped key-value rows          │    │
-│  │  3. Render 7-row scrollable detail               │    │
-│  │  4. UP/DOWN scroll, ENTER/ESC → back to LIST     │    │
-│  │  5. BtnA → back to LIST (and rescan if needed)   │    │
+│  │  1. GET http://<ip>:8001/api/v1/device/status     │    │
+│  │     (accept: application/json, 3 s budget)        │    │
+│  │  2. Parse JSON → grouped key-value rows           │    │
+│  │  3. Render 7-row scrollable detail                │    │
+│  │  4. UP/DOWN scroll, ENTER/ESC → back to LIST      │    │
+│  │  5. BtnA → back to LIST (and rescan if needed)    │    │
 │  └───────────────────────────────────────────────────┘    │
 │                                                           │
-│  ┌────────────┐ ┌───────────┐ ┌─────────────┐ ┌────────┐ │
-│  │  M5.Lcd    │ │ network   │ │ requests2   │ │ Speaker│ │
-│  │  (display) │ │ (WiFi)    │ │ (HTTP GET)  │ │(tones) │ │
-│  └────────────┘ └───────────┘ └─────────────┘ └────────┘ │
-└────────────────────────────────────────────────────────────┘
+│  ┌────────────┐ ┌───────────┐ ┌─────────────┐ ┌────────┐  │
+│  │  M5.Lcd    │ │ network   │ │ requests2   │ │ Speaker│  │
+│  │  (display) │ │ (WiFi)    │ │ (HTTP GET)  │ │(tones) │  │
+│  └────────────┘ └───────────┘ └─────────────┘ └────────┘  │
+└───────────────────────────────────────────────────────────┘
 ```
 
 - **No hard-coded IP ranges** — the sweep range is derived at runtime from the device's own `ifconfig()` (IP + netmask), so the same program works on `192.168.1.x`, `10.0.0.x`, etc.
