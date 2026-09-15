@@ -11,6 +11,7 @@ Built for **M5Cardputer** running **UIFlow 2 / MicroPython**.
 [![M5Burner](https://img.shields.io/badge/Flash-M5Burner-red.svg)](https://m5stack.com/software/)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](#)
 
+![](docs/banner.jpg)
 ---
 
 ## Application Architecture
