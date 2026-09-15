@@ -4,6 +4,13 @@ Subnet scanner for the M5Cardputer. Sweeps every host on the local LAN and calls
 
 Built for **M5Cardputer** running **UIFlow 2 / MicroPython**.
 
+[![MicroPython](https://img.shields.io/badge/MicroPython-UIFlow%202-green.svg)](https://micropython.org/)
+[![M5Cardputer](https://img.shields.io/badge/Device-M5Cardputer-blue.svg)](https://docs.m5stack.com/en/cardputer)
+[![Python](https://img.shields.io/badge/Language-Python-yellow.svg)](https://www.python.org/)
+[![AI-Flow](https://img.shields.io/badge/Build-AI--Flow-orange.svg)](https://aiflow.m5stack.com/)
+[![M5Burner](https://img.shields.io/badge/Flash-M5Burner-red.svg)](https://m5stack.com/software/)
+[![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](#)
+
 ---
 
 ## Application Architecture
