@@ -7,8 +7,20 @@
 #           UP/DOWN moves the cursor, ENTER opens the selected host.
 #
 #   DETAIL  calls GET http://<ip>:8001/api/v1/device/status with
-#           accept: application/json and shows the parsed reply, one field per
-#           line, grouped by section. UP/DOWN scrolls, ENTER or ESC goes back.
+#           accept: application/json and shows a short fixed set of fields
+#           instead of the whole reply, one field per line:
+#
+#               sdr.status      sdr.message
+#               gps.status      gps.message
+#               net.status      net.ip_address      net.hostname
+#
+#           ("net." is short for "network." so the label column stays narrow
+#           enough to leave room for the values.) A value is never wrapped:
+#           when it is wider than the value column it keeps its single line
+#           and scrolls sideways, pausing on the first characters of every
+#           pass. UP/DOWN steps that scroll by hand, ENTER or ESC goes back.
+#           A field that is absent from the reply is shown as "not in reply"
+#           so nothing is silent.
 #
 # Nothing is hardcoded: the sweep range comes from this device's ifconfig() IP
 # and netmask, and the navigation keys are read from the firmware's own
@@ -67,6 +79,36 @@ ROW_X = 14               # list text starts right of the marker triangle
 F_SMALL = None
 F_BIG = None
 
+# ---------------- detail view fields ----------------
+# Only these fields of the device status reply are shown, in this order:
+# (label on screen, path inside the JSON, kind)
+DETAIL_FIELDS = (
+    ("sdr.status",     ("sdr", "status"),         "status"),
+    ("sdr.message",    ("sdr", "message"),        "text"),
+    ("gps.status",     ("gps", "status"),         "status"),
+    ("gps.message",    ("gps", "message"),        "text"),
+    ("net.status",     ("network", "status"),     "status"),
+    ("net.ip_address", ("network", "ip_address"), "text"),
+    ("net.hostname",   ("network", "hostname"),   "text"),
+)
+MISSING = "not in reply"
+DETAIL_X = 6             # label column
+DETAIL_VX = 110          # value column (longest label is 14 characters)
+DETAIL_AVAIL = RIGHT_X - DETAIL_VX   # pixels a value gets before it scrolls
+MARQUEE_GAP = "   "      # shown between the end of a value and its restart
+MARQUEE_MS = 260         # ms per character step
+MARQUEE_HOLD = 1200      # ms the first characters stay put on every pass
+
+# Words that decide the colour of a status field. Exact matches are checked
+# first, then substrings, so "no fix" reads as bad and "fix" as good.
+GOOD_VALUES = ("ok", "up", "on", "online", "true", "yes", "healthy", "ready",
+               "active", "connected", "running", "good", "fix", "fixed", "locked")
+BAD_VALUES = ("error", "fail", "failed", "down", "off", "offline", "false",
+              "unhealthy", "disconnected", "stopped", "bad", "timeout", "no fix")
+BAD_PARTS = ("error", "fail", "offline", "unavailable", "disconnected", "denied",
+             "timeout", "no fix", "not ")
+GOOD_PARTS = ("ok", "online", "up", "fix", "ready", "active", "connected", "locked")
+
 # ---------------- state ----------------
 wlan = None
 kb = None
@@ -93,8 +135,11 @@ list_start = 0           # first hit row currently rendered
 
 view = "list"            # list | detail
 detail_ip = ""
-detail_lines = []        # (x, text, color)
-detail_top = 0
+detail_http = ""         # last HTTP outcome, shown in the title bar
+detail_rows = []         # (label, color, text, vis, cycle) per display row
+detail_sig = None        # what the body currently shows; skips redraws
+detail_tag = 0           # bumped on every fetch, forces a body repaint
+marquee_base = 0         # origin of the sideways scroll, reset on entry
 want_detail = None       # ip requested by ENTER, fetched in the main loop
 
 # Navigation keys are matched in both representations the keyboard may use:
@@ -268,56 +313,146 @@ def fmt(v):
     return str(v)
 
 
-def flatten(obj, path, out):
-    """Turn nested JSON into (kind, key, value) rows for the detail view."""
-    if hasattr(obj, "items"):
-        for k in obj:
-            v = obj[k]
-            p = "%s.%s" % (path, k) if path else "%s" % k
-            if hasattr(v, "items"):
-                out.append(("H", p))
-                flatten(v, p, out)
-            elif isinstance(v, (list, tuple)):
-                out.append(("F", str(k), ", ".join([fmt(x) for x in v])))
-            else:
-                out.append(("F", str(k), fmt(v)))
-    elif isinstance(obj, (list, tuple)):
-        for i in range(len(obj)):
-            flatten(obj[i], "%s[%d]" % (path, i), out)
-    else:
-        out.append(("F", path, fmt(obj)))
+def jsonable(v):
+    """A dict or list inside a field is shown as compact JSON, not repr()."""
+    if hasattr(v, "items") or isinstance(v, (list, tuple)):
+        try:
+            return json.dumps(v)
+        except Exception:
+            return fmt(v)
+    return fmt(v)
 
 
-def wrap_text(text, x, x_end, indent):
-    """Split text into (x, chunk) pairs so nothing leaves the screen."""
+def one_line(text, limit):
+    """Body text squeezed onto one line: control characters draw as garbage."""
     out = []
-    cur = ""
-    avail = x_end - x
-    for ch in text:
-        if text_width(cur + ch) > avail and cur:
-            out.append((x, cur))
-            x = indent
-            avail = x_end - x
-            cur = ch
-        else:
-            cur += ch
-    if cur:
-        out.append((x, cur))
-    return out
+    for ch in text[:limit]:
+        out.append(" " if ord(ch) < 32 or ord(ch) == 127 else ch)
+    return "".join(out)
 
 
-def build_detail_lines(obj):
-    """Rows of the detail view: section headers plus wrapped key = value."""
+def get_path(obj, path):
+    """Value at a dotted path; (value, False) when any level is absent."""
+    cur = obj
+    for k in path:
+        if not hasattr(cur, "items") or k not in cur:
+            return None, False
+        cur = cur[k]
+    return cur, True
+
+
+def value_color(kind, val):
+    """Status fields are colour coded; other fields stay plain white."""
+    if kind != "status":
+        return C_TEXT
+    s = fmt(val).strip().lower()
+    if s in GOOD_VALUES:
+        return C_OK
+    if s in BAD_VALUES:
+        return C_BAD
+    for w in BAD_PARTS:
+        if w in s:
+            return C_BAD
+    for w in GOOD_PARTS:
+        if w in s:
+            return C_OK
+    return C_WAIT
+
+
+def fit_chars(text, avail):
+    """How many leading characters of text fit into avail pixels."""
+    n = 0
+    while n < len(text) and text_width(text[:n + 1]) <= avail:
+        n += 1
+    return n
+
+
+def make_row(label, color, text):
+    """One display row.
+
+    label is None for a line without a label. A value wider than the value
+    column is never wrapped: the row keeps its single line and scrolls
+    sideways. cycle is the number of character steps in one full pass, or 0
+    when the value already fits and nothing has to move.
+    """
+    if text_width(text) <= DETAIL_AVAIL:
+        return (label, color, text, 0, 0)
+
+    vis = fit_chars(text, DETAIL_AVAIL)
+    cycle = len(text) + len(MARQUEE_GAP) - vis
+    if cycle < 2:
+        cycle = 2
+    return (label, color, text, vis, cycle)
+
+
+def marquee_offset(cycle):
+    """Character offset of a scrolling value right now, pausing at the start.
+
+    Offsets are derived from the clock instead of being stored, so every row
+    keeps its own pass length while all of them start together.
+    """
+    if cycle < 2:
+        return 0
+    el = time.ticks_diff(time.ticks_ms(), marquee_base)
+    if el < MARQUEE_HOLD:
+        return 0
+    return ((el - MARQUEE_HOLD) // MARQUEE_MS) % cycle
+
+
+def marquee_nudge(step):
+    """Step the sideways scroll by hand: +1 shows earlier text, -1 later."""
+    global marquee_base
+    if step > 0:
+        # Never push the origin into the future, or the value would freeze.
+        if time.ticks_diff(time.ticks_ms(), marquee_base) <= MARQUEE_HOLD:
+            return
+        marquee_base -= MARQUEE_MS
+    else:
+        marquee_base += MARQUEE_MS
+
+
+def row_segments(row, offset):
+    """(x, text, color) pieces of one row, clipped to the visible window.
+
+    The window is a plain slice, so the text simply walks past the value
+    column: no wrapping, and nothing is drawn outside the screen.
+    """
+    label, color, text, vis, cycle = row
+    if cycle >= 2:
+        shown = (text + MARQUEE_GAP)[offset:offset + vis]
+    else:
+        shown = text
+    if label is None:
+        return [(DETAIL_X, shown, color)]
+    return [(DETAIL_X, label, C_DIM), (DETAIL_VX, shown, color)]
+
+
+def has_scroll():
+    for row in detail_rows:
+        if row[4] >= 2:
+            return True
+    return False
+
+
+def build_detail_rows(obj):
+    """The seven requested fields, exactly one display row each."""
+    if not hasattr(obj, "items"):
+        return [make_row(None, C_BAD, "reply is not an object")]
+
     rows = []
-    flatten(obj, "", rows)
-    lines = []
-    for r in rows:
-        if r[0] == "H":
-            lines.append((2, "[" + r[1] + "]", C_WAIT))
+    for label, path, kind in DETAIL_FIELDS:
+        val, found = get_path(obj, path)
+        if found:
+            text = jsonable(val)
+            color = value_color(kind, val)
+            if not text:
+                text = "(empty)"
+                color = C_DIM
         else:
-            for i, (lx, chunk) in enumerate(wrap_text("%s = %s" % (r[1], r[2]), 8, RIGHT_X, 18)):
-                lines.append((lx, chunk, C_TEXT if i == 0 else C_DIM))
-    return lines
+            text = MISSING
+            color = C_DIM
+        rows.append(make_row(label, color, text))
+    return rows
 
 
 # ---------------- probes ----------------
@@ -398,21 +533,21 @@ def probe_host(ip):
 
 
 def fetch_detail(ip):
-    """Call the status API and turn the reply into display lines."""
-    global detail_lines
+    """Call the status API and keep only the requested fields."""
+    global detail_rows, detail_tag, detail_http
 
     ok, status, body = http_get("http://%s:%d%s" % (ip, PORT, DETAIL_PATH), DETAIL_HEADERS)
     print("DETAIL %s -> %s (%d bytes)" % (ip, status, len(body)))
+    detail_tag += 1
 
     if not ok:
-        note = "HTTP %s" % status
-        lines = [(8, note, C_BAD)]
-        for lx, chunk in wrap_text(body[:200], 8, RIGHT_X, 8):
-            lines.append((lx, chunk, C_DIM))
-        detail_lines = lines
+        detail_http = str(status)
+        detail_rows = [make_row(None, C_BAD, "HTTP %s" % status)]
+        if body:
+            detail_rows.append(make_row(None, C_DIM, one_line(body, 200)))
         return
 
-    lines = []
+    detail_http = "%s OK" % status
     parsed = None
     try:
         parsed = json.loads(body)
@@ -420,20 +555,21 @@ def fetch_detail(ip):
         print("DETAIL json parse failed: %s" % e)
 
     if parsed is not None:
-        lines.append((8, "%d OK" % status, C_OK))
-        lines.extend(build_detail_lines(parsed))
+        detail_rows = build_detail_rows(parsed)
     else:
-        # Not JSON: show the raw body so nothing is hidden.
-        lines.append((8, "%d OK (raw)" % status, C_WAIT))
-        for lx, chunk in wrap_text(body[:400], 8, RIGHT_X, 8):
-            lines.append((lx, chunk, C_TEXT))
-    detail_lines = lines
+        # Not JSON: show the raw body, on one scrolling line, nothing hidden.
+        detail_rows = [make_row(None, C_WAIT, "%s OK (raw)" % status)]
+        if body:
+            detail_rows.append(make_row(None, C_TEXT, one_line(body, 200)))
+
+    for row in detail_rows:
+        print("  %-16s %s" % (row[0] or "", row[2]))
 
 
 # ---------------- scan control ----------------
 def start_scan():
     global scanning, scan_next, scan_total, scan_done
-    global hits, sel, manual, list_start, view, detail_lines, detail_top
+    global hits, sel, manual, list_start, view, detail_rows, detail_sig
 
     derive_range()
     scan_next = first_host
@@ -444,8 +580,8 @@ def start_scan():
     manual = False
     list_start = 0
     view = "list"
-    detail_lines = []
-    detail_top = 0
+    detail_rows = []
+    detail_sig = None
     scanning = True
     clear_body()
     put_head("SCANNING", scan_label)
@@ -558,30 +694,38 @@ def draw_list_view():
 
 
 def draw_detail_view():
-    global detail_top
+    global detail_sig
 
-    count = len(detail_lines)
-    hi = count - DETAIL_ROWS
-    if hi < 0:
-        hi = 0
-    if detail_top > hi:
-        detail_top = hi
-    if detail_top < 0:
-        detail_top = 0
+    put_head(detail_ip, detail_http)
 
-    put_head(detail_ip, "%d/%d" % (detail_top + 1, count if count else 1))
+    # There are never more rows than the screen holds, so the only thing that
+    # can change is the sideways scroll of the long values.
+    offsets = []
+    for row in detail_rows:
+        offsets.append(marquee_offset(row[4]))
 
-    for i in range(DETAIL_ROWS):
-        idx = detail_top + i
+    # The body is repainted only when the scroll actually moves, so a still
+    # screen costs nothing while the long values keep walking.
+    sig = (detail_tag, tuple(offsets))
+    if sig == detail_sig:
+        return
+    detail_sig = sig
+    cache.clear()
+    M5.Lcd.fillRect(0, DETAIL_Y, 240, DETAIL_ROWS * LINE_H, C_BG)
+    M5.Lcd.setFont(F_SMALL)
+    for i in range(len(detail_rows)):
+        if i >= DETAIL_ROWS:
+            break
         y = DETAIL_Y + i * LINE_H
-        if idx >= count:
-            put(0, y, "", C_BG, F_SMALL, 240, LINE_H)
-            continue
-        lx, text, color = detail_lines[idx]
-        put(lx, y, text, color, F_SMALL, 240 - lx, LINE_H)
+        for seg in row_segments(detail_rows[i], offsets[i]):
+            M5.Lcd.setTextColor(seg[2], C_BG)
+            M5.Lcd.drawString(seg[1], seg[0], y)
 
     put(4, FOOT_Y, "enter/esc=back", C_DIM, F_SMALL, 150, LINE_H)
-    put_right(RIGHT_X, FOOT_Y, "scroll %d" % count, C_DIM, F_SMALL, 110, LINE_H)
+    # Always redraw the right half: the list view has its own hint there and
+    # the body repaint above does not reach the footer row.
+    put_right(RIGHT_X, FOOT_Y, "^v=scroll value" if has_scroll() else "",
+              C_DIM, F_SMALL, 130, LINE_H)
 
 
 def draw_waiting():
@@ -713,13 +857,15 @@ def log_key(s, code, slot):
 
 def handle_slot(slot):
     """Act on a recognised key."""
-    global sel, manual, view, want_detail, detail_top
+    global sel, manual, view, want_detail
 
     if view == "detail":
+        # Nothing scrolls up and down here, so the keys step the sideways
+        # scroll of the long values instead.
         if slot == "up":
-            detail_top -= 1
+            marquee_nudge(1)
         elif slot == "down":
-            detail_top += 1
+            marquee_nudge(-1)
         elif slot in ("enter", "esc"):
             view = "list"
             clear_body()
@@ -799,7 +945,8 @@ def setup():
 
 def loop():
     global state, my_ip, rssi, scanning, want_detail, view
-    global detail_ip, detail_lines, detail_top
+    global detail_ip, detail_rows, detail_sig, detail_tag, detail_http
+    global marquee_base
 
     M5.update()
     tick_keyboard()
@@ -848,13 +995,15 @@ def loop():
         want_detail = None
         view = "detail"
         detail_ip = ip
-        detail_lines = []
-        detail_top = 0
+        detail_http = ""
+        detail_rows = []
+        detail_sig = None
+        detail_tag += 1
+        marquee_base = time.ticks_ms()   # long values start from their head
         clear_body()
         put_head(ip, "")
         put(4, DETAIL_Y, "GET %s" % DETAIL_PATH, C_WAIT, F_SMALL, 232, LINE_H)
         fetch_detail(ip)
-        detail_top = 0
 
     if scanning:
         scan_step()
